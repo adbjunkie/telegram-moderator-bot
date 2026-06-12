@@ -38,18 +38,25 @@ async def _check_group_admin(message: Message, bot: Bot) -> bool:
     try:
         chat_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
         return chat_member.status in ("administrator", "creator")
-    except TelegramBadRequest:
+    except TelegramBadRequest as e:
+        logger.warning(f"Failed to check admin status for user {message.from_user.id} in chat {message.chat.id}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error checking admin: {e}")
         return False
 
 
 @router.message(Command("config"))
 async def cmd_config(message: Message, bot: Bot):
+    logger.info(f"config command from user {message.from_user.id} in chat {message.chat.id} (type={message.chat.type})")
     if message.chat.type == "private":
         await message.answer("This command can only be used in groups.")
         return
 
-    if not await _check_group_admin(message, bot):
-        await message.answer("<b>Access denied.</b> Only group admins can use this command.")
+    is_admin = await _check_group_admin(message, bot)
+    logger.info(f"admin check result: {is_admin}")
+    if not is_admin:
+        await message.answer("<b>Access denied.</b> Only group admins can use this command.\n\nMake sure the bot is an admin in this group.")
         return
 
     settings = get_group_settings(message.chat.id)
