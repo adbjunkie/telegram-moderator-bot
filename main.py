@@ -12,8 +12,8 @@ from fastapi.responses import PlainTextResponse
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
-from aiogram.types import Update, Message
+from aiogram.filters import BaseFilter, Command, CommandObject
+from aiogram.types import Update, Message, MessageReactionUpdated
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,9 +27,9 @@ logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-TOKEN          = os.environ["TELEGRAM_BOT_TOKEN"]
-PORT           = int(os.environ.get("PORT", 8000))
-OWNER_ID       = 5815775162
+TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
+PORT        = int(os.environ.get("PORT", 8000))
+OWNER_ID    = 5815775162
 
 _raw_url = os.environ.get("PUBLIC_BASE_URL", f"http://localhost:{PORT}").rstrip("/")
 if not _raw_url.startswith(("http://", "https://")):
@@ -38,26 +38,29 @@ PUBLIC_BASE_URL = _raw_url
 USE_WEBHOOK     = "localhost" not in PUBLIC_BASE_URL and PUBLIC_BASE_URL.startswith("https://")
 WEBHOOK_PATH    = "/webhook"
 
-DATA_DIR  = Path(os.environ.get("DATA_DIR", "data"))
+DATA_DIR   = Path(os.environ.get("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 
 # ── Persistent state ───────────────────────────────────────────────────────────
-# Stored in DATA_DIR/state.json so settings survive restarts.
-#
-# Schema:
 # {
-#   "media_keep":    10,
-#   "backup_links":  ["https://t.me/..."],
-#   "interval":      21600,
-#   "group_ids":     [-100123456789],
+#   "keep_count":        10,       # delete messages once there are >N in the queue
+#   "keep_minutes":      0,        # delete messages older than N minutes (0 = disabled)
+#   "delete_mode":       "count",  # "count" or "time"
+#   "reaction_threshold": 3,       # messages with >= this many reactions are kept forever
+#   "backup_links":      [],
+#   "interval":          1800,     # seconds between backup posts (default 30 min)
+#   "group_ids":         [],
 # }
 
 DEFAULTS = {
-    "media_keep":   10,
-    "backup_links": [],
-    "interval":     21600,   # seconds (6 hours)
-    "group_ids":    [],
+    "keep_count":         10,
+    "keep_minutes":       60,
+    "delete_mode":        "count",   # "count" or "time"
+    "reaction_threshold": 3,
+    "backup_links":       [],
+    "interval":           1800,      # 30 minutes
+    "group_ids":          [],
 }
 
 
@@ -71,16 +74,23 @@ def load_state() -> dict:
     return dict(DEFAULTS)
 
 
-def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+def save_state(s: dict):
+    STATE_FILE.write_text(json.dumps(s, indent=2))
 
 
 state = load_state()
 
 # ── Runtime state ──────────────────────────────────────────────────────────────
 
-# Per-group deque of message IDs for media, newest last
-media_queues: dict[int, deque] = defaultdict(deque)
+# Per-group queue of message_ids (all messages, not just media), newest last
+msg_queues: dict[int, deque] = defaultdict(deque)
+
+# message_ids that have been saved by reactions and must never be deleted
+# key: (chat_id, message_id)
+saved_by_reactions: set[tuple] = set()
+
+# pending timed-deletion tasks: (chat_id, message_id) -> asyncio.Task
+deletion_tasks: dict[tuple, asyncio.Task] = {}
 
 # ── Bot / Dispatcher ───────────────────────────────────────────────────────────
 
@@ -89,12 +99,10 @@ dp  = Dispatcher()
 router = Router()
 dp.include_router(router)
 
+
 # ── Owner guard ────────────────────────────────────────────────────────────────
 
-from aiogram.filters import BaseFilter
-
 class OwnerPrivate(BaseFilter):
-    """Only passes if the message is from the owner in a private chat."""
     async def __call__(self, message: Message) -> bool:
         return (
             message.from_user is not None
@@ -103,29 +111,110 @@ class OwnerPrivate(BaseFilter):
         )
 
 
-# ── Group media handler ────────────────────────────────────────────────────────
+# ── Deletion helpers ───────────────────────────────────────────────────────────
 
-@router.message(F.photo | F.video)
-async def handle_media(message: Message):
-    if message.chat.type not in ("group", "supergroup"):
+def _is_saved(chat_id: int, message_id: int) -> bool:
+    return (chat_id, message_id) in saved_by_reactions
+
+
+async def _delete_if_not_saved(chat_id: int, message_id: int):
+    """Delete a message unless reactions have saved it."""
+    if _is_saved(chat_id, message_id):
+        logger.info(f"Skipping deletion of {message_id} in {chat_id} — saved by reactions")
         return
+    try:
+        await bot.delete_message(chat_id, message_id)
+        logger.info(f"Deleted message {message_id} in {chat_id}")
+    except Exception as e:
+        logger.warning(f"Could not delete {message_id} in {chat_id}: {e}")
 
+
+async def _timed_delete(chat_id: int, message_id: int, delay_seconds: int):
+    """Wait delay_seconds then delete, unless saved by reactions."""
+    await asyncio.sleep(delay_seconds)
+    key = (chat_id, message_id)
+    deletion_tasks.pop(key, None)
+    await _delete_if_not_saved(chat_id, message_id)
+
+
+def _schedule_timed_delete(chat_id: int, message_id: int):
+    """Schedule a message for time-based deletion."""
+    delay = state["keep_minutes"] * 60
+    key = (chat_id, message_id)
+    # Cancel any existing task for this message
+    if key in deletion_tasks:
+        deletion_tasks[key].cancel()
+    task = asyncio.create_task(_timed_delete(chat_id, message_id, delay))
+    deletion_tasks[key] = task
+
+
+def _cancel_deletion(chat_id: int, message_id: int):
+    """Cancel a scheduled deletion (called when reactions save a message)."""
+    key = (chat_id, message_id)
+    task = deletion_tasks.pop(key, None)
+    if task:
+        task.cancel()
+        logger.info(f"Cancelled deletion of {message_id} in {chat_id} — saved by reactions")
+
+
+# ── Group message handler (all messages) ──────────────────────────────────────
+
+@router.message(F.chat.type.in_({"group", "supergroup"}))
+async def handle_group_message(message: Message):
     chat_id = message.chat.id
-    # Auto-register groups we see traffic in
+
+    # Auto-register group
     if chat_id not in state["group_ids"]:
         state["group_ids"].append(chat_id)
         save_state(state)
 
-    q = media_queues[chat_id]
+    # Don't track service messages (joins, pins, etc.) — they have no from_user text
+    if message.from_user is None:
+        return
+
+    q = msg_queues[chat_id]
     q.append(message.message_id)
 
-    while len(q) > state["media_keep"]:
-        old_id = q.popleft()
-        try:
-            await bot.delete_message(chat_id, old_id)
-            logger.info(f"Deleted media {old_id} in {chat_id}")
-        except Exception as e:
-            logger.warning(f"Could not delete {old_id} in {chat_id}: {e}")
+    mode = state["delete_mode"]
+
+    if mode == "time":
+        _schedule_timed_delete(chat_id, message.message_id)
+
+    elif mode == "count":
+        keep = state["keep_count"]
+        while len(q) > keep:
+            old_id = q.popleft()
+            await _delete_if_not_saved(chat_id, old_id)
+
+
+# ── Reaction handler ───────────────────────────────────────────────────────────
+
+@router.message_reaction()
+async def handle_reaction(event: MessageReactionUpdated):
+    """Track reactions. Once a message hits the threshold, cancel its deletion."""
+    chat_id = event.chat.id
+    message_id = event.message_id
+    key = (chat_id, message_id)
+
+    if key in saved_by_reactions:
+        return  # already saved, nothing to do
+
+    total_reactions = len(event.new_reaction)
+    if total_reactions >= state["reaction_threshold"]:
+        saved_by_reactions.add(key)
+        # Cancel any pending timed deletion
+        _cancel_deletion(chat_id, message_id)
+        # Remove from count queue so it won't be evicted
+        q = msg_queues.get(chat_id)
+        if q and message_id in q:
+            try:
+                q.remove(message_id)
+            except ValueError:
+                pass
+        logger.info(
+            f"Message {message_id} in {chat_id} saved — "
+            f"{total_reactions} reactions >= threshold {state['reaction_threshold']}"
+        )
 
 
 # ── Private commands (owner only) ──────────────────────────────────────────────
@@ -134,13 +223,20 @@ async def handle_media(message: Message):
 async def cmd_start(message: Message):
     await message.answer(
         "<b>Bot config</b>\n\n"
-        "/status — show current settings\n"
-        "/setkeep &lt;n&gt; — keep last N media messages per group (default 10)\n"
-        "/setlinks &lt;url1&gt; &lt;url2&gt; ... — set backup bot links (space or newline separated)\n"
-        "/setinterval &lt;hours&gt; — how often to post links (default 6h)\n"
-        "/addgroup &lt;chat_id&gt; — add a group to post links to\n"
-        "/removegroup &lt;chat_id&gt; — remove a group\n"
-        "/postlinks — post backup links to all groups right now\n"
+        "<b>Deletion:</b>\n"
+        "/setmode count — delete oldest once queue exceeds limit\n"
+        "/setmode time — delete every message after N minutes\n"
+        "/setkeep &lt;n&gt; — max messages to keep (count mode)\n"
+        "/settime &lt;minutes&gt; — delete messages after N minutes (time mode)\n"
+        "/setreactions &lt;n&gt; — reactions needed to save a message (default 3)\n\n"
+        "<b>Backup links:</b>\n"
+        "/setlinks &lt;url1&gt; &lt;url2&gt; ... — set backup bot links\n"
+        "/setinterval &lt;minutes&gt; — how often to post links (default 30m)\n"
+        "/postlinks — post links right now\n\n"
+        "<b>Groups:</b>\n"
+        "/addgroup &lt;chat_id&gt; — add group\n"
+        "/removegroup &lt;chat_id&gt; — remove group\n"
+        "/status — show all settings\n"
     )
 
 
@@ -148,14 +244,32 @@ async def cmd_start(message: Message):
 async def cmd_status(message: Message):
     s = state
     links = "\n".join(s["backup_links"]) or "none"
-    groups = ", ".join(str(g) for g in s["group_ids"]) or "none (auto-detected from traffic)"
+    groups = ", ".join(str(g) for g in s["group_ids"]) or "none (auto-detected)"
+    interval_min = s["interval"] // 60
     await message.answer(
         f"<b>Current settings</b>\n\n"
-        f"Media keep: <code>{s['media_keep']}</code>\n"
-        f"Post interval: <code>{s['interval'] // 3600}h {(s['interval'] % 3600) // 60}m</code>\n"
+        f"Delete mode: <code>{s['delete_mode']}</code>\n"
+        f"Keep count: <code>{s['keep_count']}</code> messages\n"
+        f"Keep time: <code>{s['keep_minutes']}</code> minutes\n"
+        f"Reaction save threshold: <code>{s['reaction_threshold']}</code> reactions\n\n"
+        f"Backup interval: <code>{interval_min}m</code>\n"
         f"Groups: <code>{groups}</code>\n\n"
         f"Backup links:\n{links}"
     )
+
+
+@router.message(Command("setmode"), OwnerPrivate())
+async def cmd_setmode(message: Message, command: CommandObject):
+    arg = (command.args or "").strip().lower()
+    if arg not in ("count", "time"):
+        await message.answer("Usage: /setmode count  or  /setmode time")
+        return
+    state["delete_mode"] = arg
+    save_state(state)
+    if arg == "count":
+        await message.answer(f"✅ Mode: <b>count</b> — keep last {state['keep_count']} messages.")
+    else:
+        await message.answer(f"✅ Mode: <b>time</b> — delete messages after {state['keep_minutes']} minutes.")
 
 
 @router.message(Command("setkeep"), OwnerPrivate())
@@ -164,16 +278,40 @@ async def cmd_setkeep(message: Message, command: CommandObject):
     if not arg.isdigit() or int(arg) < 1:
         await message.answer("Usage: /setkeep &lt;number&gt;  e.g. /setkeep 10")
         return
-    state["media_keep"] = int(arg)
+    state["keep_count"] = int(arg)
     save_state(state)
-    await message.answer(f"✅ Keeping last <b>{state['media_keep']}</b> media messages per group.")
+    await message.answer(f"✅ Keeping last <b>{state['keep_count']}</b> messages (count mode).")
+
+
+@router.message(Command("settime"), OwnerPrivate())
+async def cmd_settime(message: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg.isdigit() or int(arg) < 1:
+        await message.answer("Usage: /settime &lt;minutes&gt;  e.g. /settime 60")
+        return
+    state["keep_minutes"] = int(arg)
+    save_state(state)
+    await message.answer(f"✅ Messages will be deleted after <b>{state['keep_minutes']} minutes</b> (time mode).")
+
+
+@router.message(Command("setreactions"), OwnerPrivate())
+async def cmd_setreactions(message: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg.isdigit() or int(arg) < 1:
+        await message.answer("Usage: /setreactions &lt;number&gt;  e.g. /setreactions 3")
+        return
+    state["reaction_threshold"] = int(arg)
+    save_state(state)
+    await message.answer(
+        f"✅ Messages with <b>{state['reaction_threshold']}+ reactions</b> will never be deleted."
+    )
 
 
 @router.message(Command("setlinks"), OwnerPrivate())
 async def cmd_setlinks(message: Message, command: CommandObject):
     raw = (command.args or "").strip()
     if not raw:
-        await message.answer("Usage: /setlinks &lt;url1&gt; &lt;url2&gt; ...\nOne URL per line or space-separated.")
+        await message.answer("Usage: /setlinks &lt;url1&gt; &lt;url2&gt; ...")
         return
     links = [l.strip() for l in raw.replace("\n", " ").split() if l.strip().startswith("http")]
     if not links:
@@ -181,19 +319,18 @@ async def cmd_setlinks(message: Message, command: CommandObject):
         return
     state["backup_links"] = links
     save_state(state)
-    await message.answer(f"✅ Backup links set:\n" + "\n".join(links))
+    await message.answer("✅ Backup links set:\n" + "\n".join(links))
 
 
 @router.message(Command("setinterval"), OwnerPrivate())
 async def cmd_setinterval(message: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg.isdigit() or int(arg) < 1:
-        await message.answer("Usage: /setinterval &lt;hours&gt;  e.g. /setinterval 6")
+        await message.answer("Usage: /setinterval &lt;minutes&gt;  e.g. /setinterval 30")
         return
-    hours = int(arg)
-    state["interval"] = hours * 3600
+    state["interval"] = int(arg) * 60
     save_state(state)
-    await message.answer(f"✅ Backup links will be posted every <b>{hours}h</b>.")
+    await message.answer(f"✅ Backup links posted every <b>{arg} minutes</b>.")
 
 
 @router.message(Command("addgroup"), OwnerPrivate())
@@ -232,7 +369,6 @@ async def cmd_postlinks(message: Message):
 
 async def _post_backup_links():
     if not state["backup_links"]:
-        logger.info("No backup links configured, skipping post.")
         return
     text = "\n".join(state["backup_links"])
     for chat_id in list(state["group_ids"]):
@@ -255,7 +391,11 @@ async def backup_link_loop():
 async def lifespan(app: FastAPI):
     if USE_WEBHOOK:
         webhook_url = f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}"
-        await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        await bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=["message", "message_reaction"],
+            drop_pending_updates=True,
+        )
         logger.info(f"Webhook: {webhook_url}")
     else:
         logger.info("Polling mode")
@@ -298,5 +438,5 @@ if __name__ == "__main__":
         async def _poll():
             await bot.delete_webhook(drop_pending_updates=True)
             asyncio.create_task(backup_link_loop())
-            await dp.start_polling(bot)
+            await dp.start_polling(bot, allowed_updates=["message", "message_reaction"])
         asyncio.run(_poll())
