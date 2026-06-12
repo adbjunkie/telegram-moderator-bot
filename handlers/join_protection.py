@@ -25,7 +25,7 @@ from database import (
     is_new_user,
 )
 from utils.helpers import generate_captcha, escape_html, contains_url, delete_after, utcnow
-from utils.permissions import restrict_new_user, unmute_member, kick_member
+from utils.permissions import unmute_member, kick_member
 
 logger = logging.getLogger(__name__)
 router = Router(name="join_protection")
@@ -119,9 +119,6 @@ async def on_user_join(event: ChatMemberUpdated, bot: Bot):
     if not settings.get("captcha_enabled", True):
         return
 
-    # Restrict the user until they solve the CAPTCHA
-    restricted = await restrict_new_user(bot, chat_id, user_id)
-
     captcha_text = generate_captcha(length=1)  # single-character button captcha
     keyboard = _build_captcha_keyboard(captcha_text, user_id)
 
@@ -143,8 +140,7 @@ async def on_user_join(event: ChatMemberUpdated, bot: Bot):
     await asyncio.sleep(120)
     captcha = get_captcha(chat_id, user_id)
     if captcha and not captcha["answered"]:
-        if restricted:
-            await kick_member(bot, chat_id, user_id)
+        await kick_member(bot, chat_id, user_id)
         try:
             await msg.delete()
         except (TelegramBadRequest, TelegramForbiddenError):
