@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 import sys
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -8,22 +10,11 @@ from fastapi.responses import PlainTextResponse
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import Update, BotCommand
+from aiogram.types import Update, Message
+from aiogram import F, Router
+from dotenv import load_dotenv
 
-from config import (
-    TELEGRAM_BOT_TOKEN,
-    PUBLIC_BASE_URL,
-    WEBHOOK_PATH,
-    USE_WEBHOOK,
-    PORT,
-)
-from database import init_db
-from handlers.general import router as general_router
-from handlers.join_protection import router as join_router
-from handlers.anti_spam import router as antispam_router
-from handlers.moderation import router as moderation_router
-from handlers.ephemeral import EphemeralTrackingMiddleware, setup_ephemeral_scheduler
-from handlers.admin_config import router as admin_config_router
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,75 +23,108 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-bot = Bot(
-    token=TELEGRAM_BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+# ── Config ────────────────────────────────────────────────────────────────────
+
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+PORT = int(os.environ.get("PORT", 8000))
+
+_raw_url = os.environ.get("PUBLIC_BASE_URL", f"http://localhost:{PORT}").rstrip("/")
+if not _raw_url.startswith(("http://", "https://")):
+    _raw_url = f"https://{_raw_url}"
+PUBLIC_BASE_URL = _raw_url
+USE_WEBHOOK = "localhost" not in PUBLIC_BASE_URL and PUBLIC_BASE_URL.startswith("https://")
+WEBHOOK_PATH = "/webhook"
+
+# How many recent media messages to keep before deleting older ones
+MEDIA_KEEP_COUNT = int(os.environ.get("MEDIA_KEEP_COUNT", 10))
+
+# Backup bot links posted periodically (one per line in env var, or edit here)
+_raw_links = os.environ.get(
+    "BACKUP_LINKS",
+    "https://t.me/your_backup_bot_1\nhttps://t.me/your_backup_bot_2",
 )
+BACKUP_LINKS: list[str] = [l.strip() for l in _raw_links.splitlines() if l.strip()]
+
+# How often to post backup links (seconds). Default: every 6 hours.
+BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL_SECONDS", 6 * 3600))
+
+# Chats the bot should post backup links to (comma-separated chat IDs).
+# If empty, posts to every chat it has seen media in.
+_raw_chats = os.environ.get("BACKUP_CHAT_IDS", "")
+BACKUP_CHAT_IDS: list[int] = [int(c.strip()) for c in _raw_chats.split(",") if c.strip().lstrip("-").isdigit()]
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+# Per-chat deque of (message_id,) for media messages, newest last
+media_queues: dict[int, deque] = defaultdict(lambda: deque())
+
+# All chats we've seen (used when BACKUP_CHAT_IDS is empty)
+known_chats: set[int] = set()
+
+# ── Bot / Dispatcher ──────────────────────────────────────────────────────────
+
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-
-# Track every message for ephemeral cleanup before any handler runs.
-dp.message.outer_middleware(EphemeralTrackingMiddleware())
-
-dp.include_routers(
-    general_router,
-    moderation_router,
-    admin_config_router,
-    join_router,
-    antispam_router,
-)
-
-_scheduler = None
+router = Router()
+dp.include_router(router)
 
 
-BOT_COMMANDS = [
-    BotCommand(command="start", description="Show help"),
-    BotCommand(command="help", description="Show help"),
-    BotCommand(command="config", description="Configure the bot (admins)"),
-    BotCommand(command="setephemeral", description="Set ephemeral limits (admins)"),
-    BotCommand(command="warn", description="Warn a user (reply)"),
-    BotCommand(command="mute", description="Mute a user (reply)"),
-    BotCommand(command="unmute", description="Unmute a user (reply)"),
-    BotCommand(command="ban", description="Ban a user (reply)"),
-    BotCommand(command="unban", description="Unban a user"),
-    BotCommand(command="warnings", description="View a user's warnings (reply)"),
-    BotCommand(command="clearwarns", description="Clear a user's warnings (reply)"),
-]
+# ── Media handler ─────────────────────────────────────────────────────────────
 
+@router.message(F.photo | F.video)
+async def handle_media(message: Message):
+    chat_id = message.chat.id
+    known_chats.add(chat_id)
+    q = media_queues[chat_id]
+    q.append(message.message_id)
+
+    # Delete anything beyond the keep window
+    while len(q) > MEDIA_KEEP_COUNT:
+        old_id = q.popleft()
+        try:
+            await bot.delete_message(chat_id, old_id)
+            logger.info(f"Deleted old media message {old_id} in chat {chat_id}")
+        except Exception as e:
+            logger.warning(f"Could not delete message {old_id} in chat {chat_id}: {e}")
+
+
+# ── Backup link poster ────────────────────────────────────────────────────────
+
+async def post_backup_links():
+    """Post backup bot links to configured chats, then repeat on interval."""
+    await asyncio.sleep(BACKUP_INTERVAL)  # wait before first post
+    while True:
+        targets = BACKUP_CHAT_IDS if BACKUP_CHAT_IDS else list(known_chats)
+        if not targets:
+            logger.info("No chats to post backup links to yet.")
+        else:
+            text = "🔗 <b>Backup bots:</b>\n" + "\n".join(BACKUP_LINKS)
+            for chat_id in targets:
+                try:
+                    await bot.send_message(chat_id, text, disable_web_page_preview=True)
+                    logger.info(f"Posted backup links to {chat_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to post backup links to {chat_id}: {e}")
+        await asyncio.sleep(BACKUP_INTERVAL)
+
+
+# ── FastAPI / lifespan ────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler
-
-    init_db()
-    logger.info("Database initialized")
-
-    try:
-        await bot.set_my_commands(BOT_COMMANDS)
-    except Exception as e:
-        logger.warning(f"Failed to set bot commands: {e}")
-
     if USE_WEBHOOK:
-        webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}{WEBHOOK_PATH}"
-        await bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=dp.resolve_used_update_types(),
-            drop_pending_updates=True,
-        )
-        logger.info(f"Webhook set to {webhook_url}")
+        webhook_url = f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}"
+        await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        logger.info(f"Webhook set: {webhook_url}")
     else:
-        logger.info("Running in polling mode (no webhook)")
+        logger.info("Running in polling mode")
 
-    _scheduler = setup_ephemeral_scheduler(bot)
+    asyncio.create_task(post_backup_links())
 
     yield
 
-    if _scheduler:
-        _scheduler.shutdown(wait=False)
-
     if USE_WEBHOOK:
         await bot.delete_webhook()
-        logger.info("Webhook removed")
-
     await bot.session.close()
 
 
@@ -109,44 +133,30 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "media_keep": MEDIA_KEEP_COUNT, "backup_interval_hours": BACKUP_INTERVAL // 3600}
 
 
-async def _process_update(data: dict):
+async def _handle(data: dict):
     try:
-        update = Update.model_validate(data)
-        await dp.feed_update(bot, update)
+        await dp.feed_update(bot, Update.model_validate(data))
     except Exception as e:
-        logger.error(f"Update processing error: {e}", exc_info=True)
+        logger.error(f"Update error: {e}", exc_info=True)
 
 
 if USE_WEBHOOK:
-
     @app.post(WEBHOOK_PATH)
-    async def telegram_webhook(request: Request):
-        try:
-            data = await request.json()
-            # Process in the background so long-running handlers (e.g. CAPTCHA
-            # timeouts) don't block the webhook HTTP response.
-            asyncio.create_task(_process_update(data))
-        except Exception as e:
-            logger.error(f"Webhook parse error: {e}", exc_info=True)
+    async def webhook(request: Request):
+        asyncio.create_task(_handle(await request.json()))
         return PlainTextResponse("ok")
 
 
 if __name__ == "__main__":
-    import uvicorn
-
     if USE_WEBHOOK:
+        import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=PORT)
     else:
-        logger.info("Starting bot in polling mode...")
-
-        async def main():
+        async def _poll():
             await bot.delete_webhook(drop_pending_updates=True)
+            asyncio.create_task(post_backup_links())
             await dp.start_polling(bot)
-
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
+        asyncio.run(_poll())

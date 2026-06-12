@@ -1,8 +1,5 @@
-.env
 __pycache__/
 *.pyc
+.env
 data/
-*.db
-*.db-journal
-*.db-wal
 .venv/
