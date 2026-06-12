@@ -25,6 +25,7 @@ HELP_TEXT = (
     "/warnings — view a user's warnings\n"
     "/clearwarns — clear a user's warnings\n"
     "/config — open the settings panel\n"
+    "/setephemeral — set auto-delete limits\n"
     "/help — show this message\n\n"
     "Admins and the group owner are never moderated automatically."
 )

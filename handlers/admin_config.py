@@ -2,7 +2,7 @@ import logging
 
 from aiogram import Router, Bot, F
 from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -103,6 +103,89 @@ async def cmd_config(message: Message, bot: Bot):
 
     settings = get_group_settings(message.chat.id)
     await message.answer(_render_settings(settings), reply_markup=_main_keyboard())
+
+
+@router.message(Command("setephemeral"))
+async def cmd_set_ephemeral(message: Message, command: CommandObject, bot: Bot):
+    if message.chat.type not in GROUP_TYPES:
+        await message.answer("This command can only be used in groups.")
+        return
+
+    if not await _check_admin(bot, message.chat.id, message.from_user.id):
+        await message.answer("<b>Access denied.</b> Only group admins can use this command.")
+        return
+
+    usage = (
+        "<b>Set ephemeral message limits</b>\n\n"
+        "<code>/setephemeral count &lt;number&gt;</code> — keep only the last N messages\n"
+        "<code>/setephemeral hours &lt;number&gt;</code> — delete messages older than N hours\n"
+        "<code>/setephemeral on</code> / <code>off</code> — enable/disable\n\n"
+        "Examples:\n"
+        "<code>/setephemeral count 1000</code>\n"
+        "<code>/setephemeral hours 12</code>"
+    )
+
+    args = (command.args or "").strip().split()
+    if not args:
+        settings = get_group_settings(message.chat.id)
+        cur = (
+            f"\n\nCurrent: {'on' if settings['ephemeral_enabled'] else 'off'}, "
+            f"mode={settings['ephemeral_mode']}, "
+            f"count={settings['ephemeral_max_count']}, hours={settings['ephemeral_hours']}"
+        )
+        await message.answer(usage + cur)
+        return
+
+    settings = get_group_settings(message.chat.id)
+    sub = args[0].lower()
+
+    if sub in ("on", "enable"):
+        settings["ephemeral_enabled"] = True
+        save_group_settings(message.chat.id, settings)
+        await message.answer("✅ Ephemeral mode <b>enabled</b>.")
+        return
+
+    if sub in ("off", "disable"):
+        settings["ephemeral_enabled"] = False
+        save_group_settings(message.chat.id, settings)
+        await message.answer("✅ Ephemeral mode <b>disabled</b>.")
+        return
+
+    if sub == "count":
+        if len(args) < 2 or not args[1].isdigit():
+            await message.answer("Usage: <code>/setephemeral count &lt;number&gt;</code>")
+            return
+        value = int(args[1])
+        if value < 1 or value > 100000:
+            await message.answer("Count must be between 1 and 100000.")
+            return
+        settings["ephemeral_mode"] = "count"
+        settings["ephemeral_max_count"] = value
+        settings["ephemeral_enabled"] = True
+        save_group_settings(message.chat.id, settings)
+        await message.answer(
+            f"✅ Ephemeral set to <b>count</b> mode.\nKeeping the last <b>{value}</b> messages."
+        )
+        return
+
+    if sub == "hours":
+        if len(args) < 2 or not args[1].isdigit():
+            await message.answer("Usage: <code>/setephemeral hours &lt;number&gt;</code>")
+            return
+        value = int(args[1])
+        if value < 1 or value > 8760:  # max 1 year
+            await message.answer("Hours must be between 1 and 8760 (1 year).")
+            return
+        settings["ephemeral_mode"] = "hours"
+        settings["ephemeral_hours"] = value
+        settings["ephemeral_enabled"] = True
+        save_group_settings(message.chat.id, settings)
+        await message.answer(
+            f"✅ Ephemeral set to <b>hours</b> mode.\nDeleting messages older than <b>{value}h</b>."
+        )
+        return
+
+    await message.answer(usage)
 
 
 @router.callback_query(F.data == "cfg:show")

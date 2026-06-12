@@ -56,6 +56,7 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Show help"),
     BotCommand(command="help", description="Show help"),
     BotCommand(command="config", description="Configure the bot (admins)"),
+    BotCommand(command="setephemeral", description="Set ephemeral limits (admins)"),
     BotCommand(command="warn", description="Warn a user (reply)"),
     BotCommand(command="mute", description="Mute a user (reply)"),
     BotCommand(command="unmute", description="Unmute a user (reply)"),
