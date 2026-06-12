@@ -1,14 +1,34 @@
+import asyncio
+import logging
 import random
 import string
 import re
 from collections import defaultdict
-from typing import Dict, List, Tuple
-from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
 
 URL_PATTERN = re.compile(
     r"https?://\S+|www\.\S+|t\.me/\S+|\S+\.(com|org|net|ru|io|gg|xyz|info|biz|online|site|tk|ml|ga|cf|gq)\b",
     re.IGNORECASE,
 )
+
+
+def utcnow() -> datetime:
+    """Timezone-aware UTC now."""
+    return datetime.now(timezone.utc)
+
+
+def delete_after(bot, chat_id: int, message_id: int, delay: int):
+    """Schedule deletion of a message after `delay` seconds without blocking."""
+    async def _task():
+        try:
+            await asyncio.sleep(delay)
+            await bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+    asyncio.create_task(_task())
 
 
 def generate_captcha(length: int = 5) -> str:
@@ -21,7 +41,7 @@ def contains_url(text: str) -> bool:
 
 
 def format_time_remaining(until: datetime) -> str:
-    delta = until - datetime.utcnow()
+    delta = until - utcnow()
     if delta.total_seconds() <= 0:
         return "0m"
     total = int(delta.total_seconds())
@@ -56,7 +76,7 @@ def check_duplicate(chat_id: int, user_id: int, text: str, threshold: int, windo
     text_hash = hash(text.lower().strip())
     cached_hash, timestamps = _duplicate_cache[key]
 
-    now = datetime.utcnow()
+    now = utcnow()
     cutoff = now - timedelta(seconds=window_seconds)
 
     # Reset if it's a different message
@@ -74,7 +94,7 @@ def check_duplicate(chat_id: int, user_id: int, text: str, threshold: int, windo
 
 def clean_duplicate_cache():
     """Remove entries older than 5 minutes to prevent memory leak."""
-    now = datetime.utcnow()
+    now = utcnow()
     cutoff = now - timedelta(minutes=5)
     to_delete = []
     for key, (_, timestamps) in _duplicate_cache.items():

@@ -3,14 +3,12 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import Update
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from aiohttp import web
+from aiogram.types import Update, BotCommand
 
 from config import (
     TELEGRAM_BOT_TOKEN,
@@ -24,7 +22,7 @@ from handlers.general import router as general_router
 from handlers.join_protection import router as join_router
 from handlers.anti_spam import router as antispam_router
 from handlers.moderation import router as moderation_router
-from handlers.ephemeral import router as ephemeral_router, setup_ephemeral_scheduler
+from handlers.ephemeral import EphemeralTrackingMiddleware, setup_ephemeral_scheduler
 from handlers.admin_config import router as admin_config_router
 
 logging.basicConfig(
@@ -40,16 +38,32 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# Track every message for ephemeral cleanup before any handler runs.
+dp.message.outer_middleware(EphemeralTrackingMiddleware())
+
 dp.include_routers(
     general_router,
     moderation_router,
     admin_config_router,
     join_router,
     antispam_router,
-    ephemeral_router,
 )
 
 _scheduler = None
+
+
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Show help"),
+    BotCommand(command="help", description="Show help"),
+    BotCommand(command="config", description="Configure the bot (admins)"),
+    BotCommand(command="warn", description="Warn a user (reply)"),
+    BotCommand(command="mute", description="Mute a user (reply)"),
+    BotCommand(command="unmute", description="Unmute a user (reply)"),
+    BotCommand(command="ban", description="Ban a user (reply)"),
+    BotCommand(command="unban", description="Unban a user"),
+    BotCommand(command="warnings", description="View a user's warnings (reply)"),
+    BotCommand(command="clearwarns", description="Clear a user's warnings (reply)"),
+]
 
 
 @asynccontextmanager
@@ -59,10 +73,18 @@ async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database initialized")
 
-    webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}{WEBHOOK_PATH}"
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+    except Exception as e:
+        logger.warning(f"Failed to set bot commands: {e}")
 
     if USE_WEBHOOK:
-        await bot.set_webhook(url=webhook_url, allowed_updates=dp.resolve_used_update_types())
+        webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}{WEBHOOK_PATH}"
+        await bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=True,
+        )
         logger.info(f"Webhook set to {webhook_url}")
     else:
         logger.info("Running in polling mode (no webhook)")
@@ -89,16 +111,25 @@ async def health():
     return {"status": "ok"}
 
 
+async def _process_update(data: dict):
+    try:
+        update = Update.model_validate(data)
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logger.error(f"Update processing error: {e}", exc_info=True)
+
+
 if USE_WEBHOOK:
 
     @app.post(WEBHOOK_PATH)
     async def telegram_webhook(request: Request):
         try:
             data = await request.json()
-            update = Update.model_validate(data)
-            await dp.feed_webhook_update(bot, update)
+            # Process in the background so long-running handlers (e.g. CAPTCHA
+            # timeouts) don't block the webhook HTTP response.
+            asyncio.create_task(_process_update(data))
         except Exception as e:
-            logger.error(f"Webhook error: {e}", exc_info=True)
+            logger.error(f"Webhook parse error: {e}", exc_info=True)
         return PlainTextResponse("ok")
 
 
