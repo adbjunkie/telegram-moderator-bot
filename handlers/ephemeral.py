@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 
 from aiogram import Router, Bot, F
 from aiogram.types import Message
-from aiogram.filters import ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER
+from aiogram.filters import ChatMemberUpdatedFilter, IS_MEMBER, IS_NOT_MEMBER, Command, or_f
 from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -29,7 +29,7 @@ def _should_track(message: Message, settings: dict) -> bool:
     return True
 
 
-@router.message()
+@router.message(~F.text.startswith("/"))
 async def track_message_for_ephemeral(message: Message, bot: Bot):
     settings = get_group_settings(message.chat.id)
     if not _should_track(message, settings):
