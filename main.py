@@ -168,6 +168,14 @@ async def handle_group_message(message: Message):
         state["group_ids"].append(chat_id)
         save_state(state)
 
+    # Silently delete any command messages so /commands are invisible to everyone
+    if message.text and message.text.startswith("/"):
+        try:
+            await bot.delete_message(chat_id, message.message_id)
+        except Exception:
+            pass
+        return
+
     # Don't track service messages (joins, pins, etc.) — they have no from_user text
     if message.from_user is None:
         return
