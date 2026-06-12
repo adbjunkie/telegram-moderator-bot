@@ -42,11 +42,11 @@ dp = Dispatcher()
 
 dp.include_routers(
     general_router,
+    moderation_router,
+    admin_config_router,
     join_router,
     antispam_router,
-    moderation_router,
     ephemeral_router,
-    admin_config_router,
 )
 
 _scheduler = None

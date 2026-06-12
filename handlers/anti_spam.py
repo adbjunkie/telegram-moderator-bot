@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 router = Router(name="anti_spam")
 
 
-@router.message(F.text & ~F.via_bot)
+@router.message(F.text & ~F.via_bot & ~F.text.startswith("/"))
 async def message_spam_filter(message: Message, bot: Bot):
     chat_id = message.chat.id
     user_id = message.from_user.id

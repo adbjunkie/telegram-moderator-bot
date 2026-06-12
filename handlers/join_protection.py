@@ -218,7 +218,7 @@ async def on_user_join(event: ChatMemberUpdated, bot: Bot):
             pass
 
 
-@router.message(F.text)
+@router.message(F.text & ~F.text.startswith("/"))
 async def new_user_text_check(message: Message, bot: Bot):
     """Check if new users are sending links/media; delete if restricted."""
     settings = get_group_settings(message.chat.id)
