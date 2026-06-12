@@ -91,14 +91,16 @@ dp.include_router(router)
 
 # ── Owner guard ────────────────────────────────────────────────────────────────
 
-def owner_only(func):
-    """Decorator: ignore messages not from the owner in private chat."""
-    async def wrapper(message: Message, *args, **kwargs):
-        if message.from_user.id != OWNER_ID or message.chat.type != "private":
-            return
-        return await func(message, *args, **kwargs)
-    wrapper.__name__ = func.__name__
-    return wrapper
+from aiogram.filters import BaseFilter
+
+class OwnerPrivate(BaseFilter):
+    """Only passes if the message is from the owner in a private chat."""
+    async def __call__(self, message: Message) -> bool:
+        return (
+            message.from_user is not None
+            and message.from_user.id == OWNER_ID
+            and message.chat.type == "private"
+        )
 
 
 # ── Group media handler ────────────────────────────────────────────────────────
@@ -128,8 +130,7 @@ async def handle_media(message: Message):
 
 # ── Private commands (owner only) ──────────────────────────────────────────────
 
-@router.message(Command("start"))
-@owner_only
+@router.message(Command("start"), OwnerPrivate())
 async def cmd_start(message: Message):
     await message.answer(
         "<b>Bot config</b>\n\n"
@@ -143,8 +144,7 @@ async def cmd_start(message: Message):
     )
 
 
-@router.message(Command("status"))
-@owner_only
+@router.message(Command("status"), OwnerPrivate())
 async def cmd_status(message: Message):
     s = state
     links = "\n".join(s["backup_links"]) or "none"
@@ -158,8 +158,7 @@ async def cmd_status(message: Message):
     )
 
 
-@router.message(Command("setkeep"))
-@owner_only
+@router.message(Command("setkeep"), OwnerPrivate())
 async def cmd_setkeep(message: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg.isdigit() or int(arg) < 1:
@@ -170,8 +169,7 @@ async def cmd_setkeep(message: Message, command: CommandObject):
     await message.answer(f"✅ Keeping last <b>{state['media_keep']}</b> media messages per group.")
 
 
-@router.message(Command("setlinks"))
-@owner_only
+@router.message(Command("setlinks"), OwnerPrivate())
 async def cmd_setlinks(message: Message, command: CommandObject):
     raw = (command.args or "").strip()
     if not raw:
@@ -186,8 +184,7 @@ async def cmd_setlinks(message: Message, command: CommandObject):
     await message.answer(f"✅ Backup links set:\n" + "\n".join(links))
 
 
-@router.message(Command("setinterval"))
-@owner_only
+@router.message(Command("setinterval"), OwnerPrivate())
 async def cmd_setinterval(message: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg.isdigit() or int(arg) < 1:
@@ -199,8 +196,7 @@ async def cmd_setinterval(message: Message, command: CommandObject):
     await message.answer(f"✅ Backup links will be posted every <b>{hours}h</b>.")
 
 
-@router.message(Command("addgroup"))
-@owner_only
+@router.message(Command("addgroup"), OwnerPrivate())
 async def cmd_addgroup(message: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg.lstrip("-").isdigit():
@@ -213,8 +209,7 @@ async def cmd_addgroup(message: Message, command: CommandObject):
     await message.answer(f"✅ Group <code>{chat_id}</code> added.")
 
 
-@router.message(Command("removegroup"))
-@owner_only
+@router.message(Command("removegroup"), OwnerPrivate())
 async def cmd_removegroup(message: Message, command: CommandObject):
     arg = (command.args or "").strip()
     if not arg.lstrip("-").isdigit():
@@ -227,8 +222,7 @@ async def cmd_removegroup(message: Message, command: CommandObject):
     await message.answer(f"✅ Group <code>{chat_id}</code> removed.")
 
 
-@router.message(Command("postlinks"))
-@owner_only
+@router.message(Command("postlinks"), OwnerPrivate())
 async def cmd_postlinks(message: Message):
     await _post_backup_links()
     await message.answer("✅ Posted backup links to all groups.")
