@@ -20,6 +20,7 @@ from config import (
     PORT,
 )
 from database import init_db
+from handlers.general import router as general_router
 from handlers.join_protection import router as join_router
 from handlers.anti_spam import router as antispam_router
 from handlers.moderation import router as moderation_router
@@ -40,6 +41,7 @@ bot = Bot(
 dp = Dispatcher()
 
 dp.include_routers(
+    general_router,
     join_router,
     antispam_router,
     moderation_router,
